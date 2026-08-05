@@ -37,7 +37,7 @@ jobs:
       api_image: ${{ steps.push.outputs.api_image }}
       bridge_image: ${{ steps.push.outputs.bridge_image }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
@@ -105,7 +105,7 @@ jobs:
     environment:
       name: ${{ github.event.inputs.env || 'staging' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -173,7 +173,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' || github.event.inputs.env == 'staging'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v4
         with:
