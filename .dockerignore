@@ -1,0 +1,59 @@
+# Keep the Docker build context small. Without this the context is ~568MB:
+# ~394MB of web/node_modules plus ~59MB of stray committed binaries.
+
+# Version control
+.git
+.github
+.gitignore
+
+# Stray build artifacts committed at the repo root. These are compiled
+# api/bridge binaries (~59MB combined); .gitignore only covers /bin/.
+/api
+/bridge
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.html
+
+# Node / Next.js — reinstalled inside docker/web.Dockerfile
+web/node_modules
+web/.next
+web/out
+web/.tsbuildinfo
+web/tsconfig.tsbuildinfo
+node_modules
+
+# Secrets — never bake these into an image layer
+.env
+.env.*
+!.env.example
+!.env.prod.example
+web/.env*.local
+
+# Terraform state (unused on VPS, may contain sensitive outputs)
+deploy/terraform/.terraform/
+deploy/terraform/*.tfstate
+deploy/terraform/*.tfstate.*
+deploy/terraform/terraform.tfvars
+
+# Local data / runtime state
+/data/
+/tmp/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Docs and agent config — not needed to build
+*.md
+!README.md
+.claude/

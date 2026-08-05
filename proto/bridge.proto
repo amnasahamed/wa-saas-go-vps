@@ -1,0 +1,110 @@
+// Bridge gRPC service.
+//
+// The orchestrator (cmd/api) calls these RPCs on cmd/bridge workers.
+// The bridge worker streams QR events back to the orchestrator (which
+// forwards them to the dashboard over a long-poll or WebSocket).
+//
+// Auth: every RPC carries an API key in the metadata header `x-api-key`.
+// The bridge validates it against its tenant lookup table before acting.
+
+syntax = "proto3";
+
+package niosengine.bridge.v1;
+
+option go_package = "github.com/amnasahamed/niosengine/proto/bridge;bridgepb";
+
+import "google/protobuf/timestamp.proto";
+
+// ----- Inbound event: bridge → orchestrator -----
+// Sent when a whatsmeow event arrives for a tenant's session.
+// IdempotencyKey is tenant_id + provider_message_id, durable across retries.
+
+message InboundEvent {
+  string tenant_id = 1;
+  string whatsapp_session_id = 2;
+  string provider_message_id = 3;
+  string phone = 4;                  // normalized
+  string direction = 5;              // "inbound" | "outbound"
+  string sender = 6;                 // "customer" | "ai" | "counselor"
+  string message_type = 7;           // "text" | "image" | etc.
+  string body = 8;
+  string media_s3_key = 9;           // empty for text-only
+  string media_mimetype = 10;
+  google.protobuf.Timestamp timestamp = 11;
+  string idempotency_key = 12;
+}
+
+message InboundAck {
+  bool ok = 1;
+  string error = 2;                  // populated on failure
+}
+
+// BridgeService is implemented by cmd/api.
+service BridgeToAPI {
+  // Report an inbound WhatsApp event. The orchestrator persists, runs
+  // extraction, and acks.
+  rpc ReportInbound(InboundEvent) returns (InboundAck);
+}
+
+// ----- Outbound command: orchestrator → bridge -----
+// Used to send AI replies. The bridge calls whatsmeow.SendMessage, marks
+// the message in its in-memory sender classifier, and acks with the
+// provider_message_id.
+
+message SendMessageRequest {
+  string tenant_id = 1;
+  string whatsapp_session_id = 2;
+  string phone = 3;
+  string body = 4;
+  string caption = 5;
+  string media_s3_key = 6;
+  string media_mimetype = 7;
+  string filename = 8;
+  bool send_as_voice = 9;
+  bool send_as_document = 10;
+  bool separate_messages = 11;       // text + media as separate sends
+  string client_msg_id = 12;         // dedup anchor
+}
+
+message SendMessageResponse {
+  bool ok = 1;
+  string provider_message_id = 2;
+  string error = 3;
+  bool deduplicated = 4;
+}
+
+// ----- QR event: bridge → orchestrator (server stream) -----
+// The orchestrator opens this stream when a tenant starts linking WhatsApp.
+// Bridge pushes each new QR until authentication succeeds.
+
+message StreamQRRequest {
+  string tenant_id = 1;
+  string whatsapp_session_id = 2;
+}
+
+message QREvent {
+  string code = 1;
+  string data_url = 2;                // data:image/png;base64,...
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+message LinkResult {
+  bool authenticated = 1;
+  string phone_number = 2;
+  string push_name = 3;
+  string error = 4;
+}
+
+// APIToBridge is implemented by cmd/bridge.
+service APIToBridge {
+  // Send an outbound WhatsApp message.
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+
+  // Stream QR codes while a tenant is linking WhatsApp. Closes once the
+  // session reaches `authenticated` state, or after an error.
+  rpc StreamQR(StreamQRRequest) returns (stream QREvent);
+
+  // One-shot RPC: register a new session with the bridge worker. Returns
+  // the assigned session_id and the first QR event.
+  rpc StartLink(StreamQRRequest) returns (LinkResult);
+}

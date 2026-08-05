@@ -1,0 +1,54 @@
+# Caddy reverse proxy for the single-VPS deployment.
+#
+# Mounted read-only at /etc/caddy/Caddyfile by docker-compose.prod.yml.
+# APP_DOMAIN and ACME_EMAIL come from .env.prod.
+#
+# Caddy obtains and renews a Let's Encrypt certificate automatically. That
+# requires an A/AAAA record for $APP_DOMAIN pointing at this VPS, with ports
+# 80 and 443 reachable. Certificates live in the caddy_data volume — keep it,
+# or repeated redeploys will hit Let's Encrypt rate limits.
+
+{
+	email {$ACME_EMAIL}
+
+	# Uncomment to test against the LE staging CA while setting DNS up. Staging
+	# certs are untrusted by browsers but are not rate limited.
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+{$APP_DOMAIN} {
+	encode zstd gzip
+
+	# Security headers. HSTS is intentionally left out until you have confirmed
+	# the domain is HTTPS-only for good — it is hard to undo in browsers.
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	# The Go API. Auth is an HttpOnly `nios_session` cookie and the dashboard
+	# calls /api/v1/* with credentials: "include" (web/lib/api.ts), so the API
+	# MUST be served from this same origin or the cookie is never sent.
+	#
+	# handle_path strips the /api prefix, so /api/v1/leads -> /v1/leads, which is
+	# what cmd/api registers.
+	handle_path /api/* {
+		reverse_proxy api:8080 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# Note: cmd/api registers no Stripe webhook route yet (billing is Phase 2).
+	# When it lands, add a handle block for it here — outside /api/* if you want
+	# a stable public path to paste into the Stripe dashboard.
+
+	# Everything else is the Next.js dashboard.
+	reverse_proxy web:3000
+
+	log {
+		output stdout
+		format console
+	}
+}

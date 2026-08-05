@@ -1,0 +1,9 @@
+# Default owners for everything
+*       @amnasahamed
+
+# Migrations need extra eyes
+/migrations/   @amnasahamed
+/db/queries/   @amnasahamed
+
+# Infra
+/deploy/       @amnasahamed

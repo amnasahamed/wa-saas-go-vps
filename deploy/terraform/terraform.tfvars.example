@@ -1,0 +1,19 @@
+# Copy to terraform.tfvars and fill in real values. Never commit the real
+# tfvars file (gitignored).
+
+env              = "staging"
+aws_region       = "us-east-1"
+domain_name      = "niosengine.app"
+
+# Image URIs are normally injected by CI at apply time, but you can pin here
+# for local terraform plan/validate cycles.
+container_image_api    = "niosengine/api:dev"
+container_image_bridge = "niosengine/bridge:dev"
+
+# Secrets — set these via environment variables in CI rather than committing:
+#   TF_VAR_openai_api_key=...
+#   TF_VAR_stripe_secret_key=...
+#   TF_VAR_stripe_webhook_secret=...
+# openai_api_key        = ""
+# stripe_secret_key     = ""
+# stripe_webhook_secret = ""

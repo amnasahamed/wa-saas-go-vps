@@ -1,0 +1,201 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "web/**"
+      - "**/*.md"
+      - ".github/CODEOWNERS"
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Environment to deploy to"
+        required: true
+        default: staging
+        type: choice
+        options:
+          - staging
+          - prod
+
+concurrency:
+  group: deploy-${{ github.event.inputs.env || 'staging' }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: "1.26"
+  AWS_REGION: us-east-1
+
+jobs:
+  build-and-push:
+    name: build + push images
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # for OIDC
+      contents: read
+    outputs:
+      api_image: ${{ steps.push.outputs.api_image }}
+      bridge_image: ${{ steps.push.outputs.bridge_image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install sqlc
+        run: go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.27.0
+
+      - name: Regenerate sqlc
+        run: sqlc generate
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build + push api
+        id: push
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ENV: ${{ github.event.inputs.env || 'staging' }}
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-12)
+          IMAGE="$ECR_REGISTRY/niosengine/${ENV}/api:${SHORT_SHA}"
+          docker buildx build \
+            --build-arg CMD=api \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            --tag "$IMAGE" \
+            --push \
+            -f docker/api.Dockerfile .
+          echo "api_image=$IMAGE" >> $GITHUB_OUTPUT
+
+          IMAGE="$ECR_REGISTRY/niosengine/${ENV}/bridge:${SHORT_SHA}"
+          docker buildx build \
+            --build-arg CMD=bridge \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            --tag "$IMAGE" \
+            --push \
+            -f docker/api.Dockerfile .
+          echo "bridge_image=$IMAGE" >> $GITHUB_OUTPUT
+
+  deploy-ecs:
+    name: deploy to ECS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.env || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run database migrations
+        run: |
+          CLUSTER=$(aws ecs list-clusters --query 'clusterArns[?contains(@, `niosengine-${{ github.event.inputs.env || ''staging'' }}`)]' --output text)
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --task-definition niosengine-${{ github.event.inputs.env || 'staging' }}-migrate \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$(terraform output -raw private_subnets)],securityGroups=[$(terraform output -raw migrate_sg)],assignPublicIp=ENABLED}" \
+            --query 'tasks[0].taskArn' --output text 2>/dev/null || echo "no-migrate-task")
+          echo "migration task: $TASK_ARN"
+          # If the migrate task definition doesn't exist yet, this is a no-op
+          # for Phase 0. The migrations run on app start via cmd/migrate.
+
+      - name: Trigger ECS rolling deploy
+        run: |
+          ENV=${{ github.event.inputs.env || 'staging' }}
+          CLUSTER="niosengine-${ENV}"
+          for SERVICE in api bridge; do
+            echo "Deploying $SERVICE..."
+            aws ecs update-service \
+              --cluster "$CLUSTER" \
+              --service "niosengine-${ENV}-${SERVICE}" \
+              --force-new-deployment \
+              --query 'service.deployments[0].status' \
+              --output text
+          done
+
+      - name: Wait for stable
+        run: |
+          ENV=${{ github.event.inputs.env || 'staging' }}
+          CLUSTER="niosengine-${ENV}"
+          for SERVICE in api bridge; do
+            echo "Waiting for niosengine-${ENV}-${SERVICE} to stabilize..."
+            aws ecs wait services-stable \
+              --cluster "$CLUSTER" \
+              --services "niosengine-${ENV}-${SERVICE}"
+          done
+
+      - name: Smoke test
+        run: |
+          ALB=$(aws elbv2 describe-load-balancers \
+            --names "niosengine-${ENV}-api" \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          echo "ALB: $ALB"
+          for i in {1..10}; do
+            if curl -fsS "http://${ALB}/healthz" > /dev/null; then
+              echo "healthz OK"
+              break
+            fi
+            echo "waiting for healthz... ($i/10)"
+            sleep 5
+          done
+        env:
+          ENV: ${{ github.event.inputs.env || 'staging' }}
+
+  deploy-web:
+    name: deploy dashboard to Vercel
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.inputs.env == 'staging'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@9 --activate
+
+      - name: Install Vercel CLI
+        run: npm install -g vercel@latest
+
+      - name: Pull Vercel config
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: web
+
+      - name: Build
+        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: web
+
+      - name: Deploy
+        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: web
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}

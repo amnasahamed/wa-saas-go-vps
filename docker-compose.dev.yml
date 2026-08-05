@@ -1,0 +1,156 @@
+# Local development stack.
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml up --build
+#   docker compose -f docker-compose.dev.yml run --rm migrate
+#
+# Bring up: postgres, redis, localstack (S3), mailhog (SES stub),
+# cmd/api, cmd/bridge, the Next.js dashboard.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: niosengine-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: niosengine
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: niosengine-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  localstack:
+    image: localstack/localstack:3
+    container_name: niosengine-localstack
+    environment:
+      SERVICES: s3,ses
+      DEFAULT_REGION: us-east-1
+      DEBUG: 0
+    ports:
+      - "4566:4566"
+    volumes:
+      - localstack_data:/var/lib/localstack
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: niosengine-mailhog
+    ports:
+      - "1025:1025"   # SMTP
+      - "8025:8025"   # Web UI
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+      args:
+        CMD: api
+    container_name: niosengine-api
+    environment:
+      SERVICE_NAME: api
+      ENV: dev
+      LOG_LEVEL: debug
+      API_LISTEN_ADDR: ":8080"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/niosengine?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://localstack:4566
+      S3_MEDIA_BUCKET: niosengine-media
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-placeholder}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-sk_test_placeholder}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-whsec_placeholder}
+      SES_FROM_EMAIL: dev@niosengine.local
+      INBOUND_API_BASE_URL: http://localhost:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+  bridge:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+      args:
+        CMD: bridge
+    container_name: niosengine-bridge
+    environment:
+      SERVICE_NAME: bridge
+      ENV: dev
+      LOG_LEVEL: debug
+      BRIDGE_GRPC_ADDR: ":9090"
+      BRIDGE_WORKER_ID: local-dev
+      BRIDGE_MAX_SESSIONS: 10
+      # Persist whatsmeow device state so restarting the dev stack does not
+      # force a re-scan of the QR code.
+      BRIDGE_STATE_DIR: /var/lib/niosengine/bridge
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/niosengine?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://localstack:4566
+      S3_MEDIA_BUCKET: niosengine-media
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    volumes:
+      - bridge_state:/var/lib/niosengine/bridge
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "9090:9090"
+
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+      args:
+        CMD: migrate
+    container_name: niosengine-migrate
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/niosengine?sslmode=disable
+      MIGRATIONS_DIR: migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["migrate"]
+
+  dashboard:
+    image: node:20-alpine
+    container_name: niosengine-dashboard
+    working_dir: /app
+    command: sh -c "corepack enable && pnpm install && pnpm dev"
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8080
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+    volumes:
+      - ./web:/app
+    ports:
+      - "3000:3000"
+    profiles: ["frontend"]
+
+volumes:
+  postgres_data:
+  localstack_data:
+  bridge_state:

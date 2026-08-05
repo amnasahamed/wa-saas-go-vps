@@ -1,0 +1,71 @@
+# Binaries
+/bin/
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+# Stray compiled binaries committed to the repo root. The Makefile builds
+# into ./bin/; these are leftover from a `go build ./...` run.
+/api
+/bridge
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+
+# Dependency directories (remove the comment to enable it)
+vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Env files
+.env
+.env.local
+.env.*.local
+# Production secrets for the VPS deploy. The .example templates are tracked;
+# the real files must never be. Note `.env` above does not cover these.
+.env.prod
+.env.production
+.env.staging
+!.env.example
+!.env.prod.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local dev
+/data/
+/tmp/
+*.log
+
+# Terraform
+deploy/terraform/.terraform/
+deploy/terraform/*.tfstate
+deploy/terraform/*.tfstate.*
+deploy/terraform/.terraform.lock.hcl
+deploy/terraform/terraform.tfvars
+
+# Next.js
+web/.next/
+web/out/
+web/node_modules/
+web/.env*.local
+web/next-env.d.ts
+web/.tsbuildinfo
+
+# Local SQL/seed data
+*.sqlite
+*.db

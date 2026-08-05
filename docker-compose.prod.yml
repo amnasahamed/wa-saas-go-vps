@@ -1,0 +1,226 @@
+# Production stack for a single VPS.
+#
+# Usage (see deploy/vps/README.md for the full runbook):
+#   cp .env.prod.example .env.prod && $EDITOR .env.prod
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#
+# Design notes:
+#   - Only caddy publishes ports. Postgres and Redis are reachable solely on the
+#     internal network, never from the public internet.
+#   - migrate runs to completion before api/bridge start.
+#   - Healthchecks hit /healthz, NOT /readyz. The bridge's /readyz intentionally
+#     returns 503 until a tenant links WhatsApp, so a /readyz check would mark a
+#     fresh deployment permanently unhealthy.
+
+name: niosengine
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-niosengine}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-niosengine}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-niosengine} -d ${POSTGRES_DB:-niosengine}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [internal]
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # appendonly persists the reply-delay ZSET across restarts; without it a
+    # restart silently drops every scheduled nurture reply.
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+    logging: *default-logging
+
+  # One-shot goose runner. api/bridge wait for this to exit 0.
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+      args:
+        CMD: migrate
+    restart: "no"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      MIGRATIONS_DIR: migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [internal]
+    logging: *default-logging
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+      args:
+        CMD: api
+    restart: unless-stopped
+    environment:
+      SERVICE_NAME: api
+      ENV: ${ENV:-prod}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      API_LISTEN_ADDR: ":8080"
+      API_GRPC_LISTEN_ADDR: ":8081"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      # Required: api refuses to boot outside dev without a 32+ byte secret.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required (openssl rand -base64 48)}
+      # Must be the public origin, else the dashboard's cookie requests are
+      # rejected by the CORS middleware.
+      CORS_ORIGINS: https://${APP_DOMAIN}
+      INBOUND_API_BASE_URL: https://${APP_DOMAIN}
+      # worker_id -> gRPC address map, used to route sends to the bridge that
+      # owns a tenant's WhatsApp session. Add an entry per bridge worker.
+      BRIDGE_GRPC_TARGETS: ${BRIDGE_GRPC_TARGETS:-worker-1=bridge:9090}
+      # Service-to-service gRPC auth. Required outside dev; same value as the
+      # bridge's GRPC_SHARED_SECRET.
+      GRPC_SHARED_SECRET: ${GRPC_SHARED_SECRET:?GRPC_SHARED_SECRET is required}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      SES_FROM_EMAIL: ${SES_FROM_EMAIL:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks: [internal]
+    logging: *default-logging
+
+  # WhatsApp worker. NOT horizontally scalable behind a load balancer: each
+  # worker owns its tenants' device state in a local SQLite file keyed by
+  # BRIDGE_WORKER_ID (see internal/whatsapp/manager.go). To add a second worker,
+  # copy this block, give it a distinct BRIDGE_WORKER_ID and its own volume,
+  # then add it to BRIDGE_GRPC_TARGETS above.
+  bridge:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+      args:
+        CMD: bridge
+    restart: unless-stopped
+    environment:
+      SERVICE_NAME: bridge
+      ENV: ${ENV:-prod}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      BRIDGE_GRPC_ADDR: ":9090"
+      BRIDGE_HTTP_ADDR: ":9091"
+      BRIDGE_WORKER_ID: ${BRIDGE_WORKER_ID:-worker-1}
+      BRIDGE_MAX_SESSIONS: ${BRIDGE_MAX_SESSIONS:-50}
+      # Persistent device state. Losing this volume forces every tenant to
+      # re-scan a QR code — there is no S3 backup in the code.
+      BRIDGE_STATE_DIR: /var/lib/niosengine/bridge
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      # Explicit: the built-in fallback points at the API's HTTP port and fails.
+      API_GRPC_ADDR: api:8081
+      # Service-to-service gRPC auth. Must match the api's value exactly.
+      GRPC_SHARED_SECRET: ${GRPC_SHARED_SECRET:?GRPC_SHARED_SECRET is required}
+    volumes:
+      - bridge_state:/var/lib/niosengine/bridge
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # /healthz only. /readyz returns 503 until a tenant links WhatsApp, which
+      # would leave a fresh deploy permanently unhealthy.
+      test: ["CMD", "/app/healthcheck", "http://127.0.0.1:9091/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks: [internal]
+    logging: *default-logging
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+      args:
+        NEXT_PUBLIC_APP_URL: https://${APP_DOMAIN}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # Server-side only (next.config.mjs rewrites fallback); Caddy owns the
+      # real /api/v1 route so the browser never uses this.
+      NEXT_PUBLIC_API_BASE_URL: http://api:8080
+      NEXT_PUBLIC_APP_URL: https://${APP_DOMAIN}
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks: [internal]
+    logging: *default-logging
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?APP_DOMAIN is required}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL is required}
+    volumes:
+      - ./deploy/vps/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # issued certs — persist or you WILL hit LE rate limits
+      - caddy_config:/config
+    depends_on:
+      - web
+      - api
+    networks: [internal]
+    logging: *default-logging
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  bridge_state:
+  caddy_data:
+  caddy_config:
